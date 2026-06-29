@@ -1,0 +1,411 @@
+你是一位精通 Vue 3 + Express + MySQL 全栈开发的高级工程师。你的任务是完善 GPUStore 电商项目的订单购买与支付流程，实现以下业务逻辑：
+
+1. 商品详情页点击"立即购买" → 生成待付款订单 → 进入结算中心
+2. 购物车点击"提交订单" → 生成待付款订单 → 进入结算中心
+3. 结算中心点击"立即结算" → 支付成功 → 订单进入"待收货" → 30秒后自动变为"待评价"
+4. 结算中心未支付直接退出 → 订单保持"待付款"，可在订单列表继续支付
+
+---
+
+### 一、核心流程与状态定义
+
+订单状态流转：
+- `pending`（待付款）：创建订单后的初始状态
+- `shipped`（待收货）：用户点击"立即结算"支付成功后
+- `delivered`（待评价）：支付成功页倒计时 30 秒后自动流转
+- `completed`（已完成）：用户点击"去评价"后（评价功能可后续再做）
+- `cancelled`（已取消）：用户主动取消
+
+---
+
+### 二、你需要完成的具体修改
+
+#### 2.1 后端 `backend/routes/orders.js` — 添加获取单个订单接口
+
+在现有路由中添加：
+
+```javascript
+// 获取单个订单详情
+router.get('/:id', async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  try {
+    const [orders] = await db.execute(
+      'SELECT * FROM orders WHERE id = ? AND user_id = ?',
+      [id, userId]
+    );
+    if (orders.length === 0) {
+      return res.status(404).json({ message: '订单不存在' });
+    }
+    const order = orders[0];
+    const [items] = await db.execute(
+      'SELECT * FROM order_items WHERE order_id = ?',
+      [order.id]
+    );
+    order.items = items;
+    res.json(order);
+  } catch (err) {
+    console.error('获取订单详情失败:', err);
+    res.status(500).json({ message: '获取订单详情失败' });
+  }
+});
+```
+
+#### 2.2 前端 API 层 `src/services/api.js` — 补充获取单个订单
+
+在 `orderAPI` 中添加：
+```javascript
+getOrder: (id) => api.get(`/orders/${id}`).then(res => res.data),
+```
+
+#### 2.3 商品详情页 `src/components/productinfo/components/PAction.vue` — 修改"立即购买"
+
+将 `goAddCarts` 方法改为：
+
+```javascript
+async goAddCarts() {
+  if (!this.product) return;
+  if (this.product.stock !== undefined && this.product.stock <= 0) {
+    showToast('该商品暂时缺货');
+    return;
+  }
+
+  // 1. 调用后端创建待付款订单
+  try {
+    const order = await orderAPI.createOrder({
+      items: [{
+        product_id: this.product.id,
+        quantity: 1
+      }]
+    });
+    // 2. 创建成功后跳转到结算中心，携带订单 ID
+    this.$router.push({ path: '/pay', query: { orderId: order.id } });
+  } catch (error) {
+    const msg = error.response?.data?.message || '创建订单失败，请稍后重试';
+    showToast(msg);
+  }
+}
+```
+
+**注意**：不再将商品加入购物车再跳转，而是直接创建订单后跳转。
+
+#### 2.4 购物车页 `src/components/Cart/RtIndex.vue` — 修改"提交订单"
+
+将 `onSubmit` 方法中最后的跳转逻辑改为：
+
+```javascript
+async onSubmit() {
+  // ... 保留原有的库存校验和地址校验逻辑 ...
+
+  const checkedItems = this.carts.filter(item => this.blnCheckedById(item.id));
+  if (checkedItems.length === 0) {
+    showToast('请选择要购买的商品');
+    return;
+  }
+
+  // 1. 调用后端创建待付款订单
+  try {
+    const order = await orderAPI.createOrder({
+      items: checkedItems.map(item => ({
+        product_id: item.product_id,
+        quantity: item.num
+      }))
+    });
+    
+    // 2. 清空本地已选中的购物车项（后端购物车项已在创建订单时由 shopStore.createOrderAPI 处理）
+    // 如果 createOrderAPI 会清空购物车，这里不需要额外处理；
+    // 如果 Cart 组件独立管理，可以在此手动调用 removeFromCartAPI 逐个删除
+    
+    // 3. 跳转到结算中心，携带订单 ID
+    this.$router.push({ path: '/pay', query: { orderId: order.id } });
+  } catch (error) {
+    const msg = error.response?.data?.message || '创建订单失败，请稍后重试';
+    showToast(msg);
+  }
+}
+```
+
+**注意**：由于 `shopStore.createOrderAPI` 已改为"先调后端"模式，如果购物车组件希望复用该逻辑，也可以改为调用 `store.createOrderAPI` 再跳转。但当前 Cart 组件独立处理更可控。
+
+#### 2.5 结算中心 `src/components/pay/RtIndex.vue` — 支持订单支付模式
+
+**A. 数据与逻辑修改**
+
+在 `data()` 中添加：
+```javascript
+orderId: null,
+orderData: null,
+loadingOrder: false
+```
+
+**B. 修改 `mounted` 钩子**
+
+```javascript
+async mounted() {
+  this.initChosenAddress();
+  
+  // 检查是否有 orderId 参数（从"立即购买"或"提交订单"进入）
+  const queryOrderId = this.$route.query.orderId;
+  if (queryOrderId) {
+    this.orderId = queryOrderId;
+    await this.loadOrderDetail(queryOrderId);
+  }
+}
+```
+
+**C. 添加加载订单详情方法**
+
+```javascript
+async loadOrderDetail(id) {
+  this.loadingOrder = true;
+  try {
+    const order = await orderAPI.getOrder(id);
+    this.orderData = order;
+  } catch (error) {
+    showToast('加载订单失败');
+  } finally {
+    this.loadingOrder = false;
+  }
+}
+```
+
+**D. 修改 `computed` 中的 `payProd`**
+
+```javascript
+payProd() {
+  // 如果有订单数据，展示订单中的商品
+  if (this.orderData && this.orderData.items) {
+    return this.orderData.items.map(item => ({
+      product_id: item.product_id,
+      title: item.product_name,
+      price: item.price,
+      num: item.quantity,
+      image: item.image_url
+    }));
+  }
+  // 否则兼容旧逻辑：展示购物车中 checked 的商品
+  return shopStore().carts.filter(item => item.checked == true);
+}
+```
+
+**E. 修改 `sumPrice`**
+
+```javascript
+sumPrice() {
+  let total = 0;
+  const items = this.payProd;
+  items.forEach(item => {
+    total += (Number(item.num) || 0) * (Number(item.price) || 0);
+  });
+  return total;
+}
+```
+
+**F. 修改 `onSubmit` 方法**
+
+```javascript
+async onSubmit() {
+  if (this.submitting) return;
+  
+  // 如果有 orderId，走"支付已有订单"流程
+  if (this.orderId) {
+    this.submitting = true;
+    try {
+      // 调用后端修改订单状态为 shipped（待收货）
+      await orderAPI.updateOrderStatus(this.orderId, 'shipped');
+      // 跳转到支付成功页，携带订单 ID
+      this.$router.push({ path: '/paysuccess', query: { orderId: this.orderId } });
+    } catch (error) {
+      const msg = error.response?.data?.message || '支付失败，请稍后重试';
+      showToast(msg);
+    } finally {
+      this.submitting = false;
+    }
+    return;
+  }
+
+  // 如果没有 orderId，走原来的"从购物车创建订单"兼容逻辑
+  const payProds = this.carts.filter(item => item.checked);
+  if (payProds.length === 0 || this.sumPrice <= 0) {
+    showToast('请选择要购买的商品');
+    return;
+  }
+  if (!this.currentAddress || !this.currentAddress.id) {
+    showToast('请先选择收货地址');
+    return;
+  }
+
+  const insufficientItems = payProds.filter(item => item.stock !== undefined && item.num > item.stock);
+  if (insufficientItems.length > 0) {
+    const names = insufficientItems.map(i => i.title).join('、');
+    showToast(`${names} 库存不足，请调整数量`);
+    return;
+  }
+
+  this.submitting = true;
+  const store = shopStore();
+  try {
+    await store.createOrderAPI({
+      totalPrice: this.sumPrice,
+      items: payProds.map(item => ({
+        product_id: item.product_id,
+        title: item.title,
+        price: item.price,
+        quantity: item.num,
+        image_url: item.image || item.img || ''
+      }))
+    });
+    this.$router.push("/paysuccess");
+  } catch (error) {
+    const msg = error.response?.data?.message || '订单提交失败，请稍后重试';
+    showToast(msg);
+  } finally {
+    this.submitting = false;
+  }
+}
+```
+
+**G. 模板中展示订单号**
+
+在商品清单上方添加：
+```vue
+<div v-if="orderId" class="order-info">
+  <div class="title">订单信息</div>
+  <div class="order-id">订单号: {{ orderId }}</div>
+  <div class="order-status">状态: 待付款</div>
+</div>
+```
+
+#### 2.6 支付成功页 `src/components/pay/components/RtPaySuccess.vue` — 添加30秒倒计时与自动流转
+
+**重写整个组件**：
+
+```vue
+<template>
+  <div class="success">
+    <van-icon name="checked" />
+    <h3>支付成功</h3>
+    <p v-if="!delivered">
+      您的商品正在发货中，预计 <span class="countdown">{{ countdown }}秒</span> 后送达
+    </p>
+    <p v-else>
+      商品已送达！请前往
+      <router-link :to="{ path: '/orderlist', query: { active: 3 } }">待评价</router-link>
+      进行评价
+    </p>
+    <p class="links">
+      <router-link to="/orderlist">查看订单</router-link>
+      &nbsp;|&nbsp;
+      <router-link to="/home">返回首页</router-link>
+    </p>
+  </div>
+</template>
+
+<script>
+import { orderAPI } from '@/services/api';
+import { showToast } from 'vant';
+
+export default {
+  name: "PaySuccess",
+  data() {
+    return {
+      orderId: null,
+      countdown: 30,
+      delivered: false,
+      timer: null
+    }
+  },
+  async mounted() {
+    this.orderId = this.$route.query.orderId || null;
+    if (this.orderId) {
+      this.startDeliveryTimer();
+    }
+  },
+  beforeUnmount() {
+    if (this.timer) {
+      clearInterval(this.timer);
+    }
+  },
+  methods: {
+    startDeliveryTimer() {
+      this.timer = setInterval(async () => {
+        this.countdown--;
+        if (this.countdown <= 0) {
+          clearInterval(this.timer);
+          this.timer = null;
+          await this.autoDeliver();
+        }
+      }, 1000);
+    },
+    async autoDeliver() {
+      if (!this.orderId) return;
+      try {
+        await orderAPI.updateOrderStatus(this.orderId, 'delivered');
+        this.delivered = true;
+        showToast('商品已送达');
+      } catch (error) {
+        console.error('自动流转订单状态失败:', error);
+      }
+    }
+  }
+}
+</script>
+
+<style scoped>
+.success {
+  width: 90%;
+  margin: auto;
+  text-align: center;
+  padding-top: 20%;
+}
+.success h3 {
+  font-size: 18px;
+  margin-top: 16px;
+  margin-bottom: 10px;
+}
+.success .van-icon {
+  font-size: 70px;
+  color: #52b838;
+}
+.success p {
+  font-size: 14px;
+  color: #666;
+  line-height: 1.8;
+}
+.countdown {
+  color: #ee0a24;
+  font-weight: bold;
+  font-size: 16px;
+}
+.links {
+  margin-top: 20px;
+}
+.links a {
+  color: #1574e3;
+}
+</style>
+```
+
+#### 2.7 订单列表 `src/components/my/components/RtOrderList.vue` — 支持 URL 参数定位 tab
+
+修改 `mounted`：
+
+```javascript
+async mounted() {
+  // 支持 URL 参数定位 tab
+  const queryActive = parseInt(this.$route.query.active || this.$route.params.active || 0);
+  this.active = queryActive;
+  await this.loadOrders();
+}
+```
+
+---
+
+### 三、修改原则
+
+1. **兼容旧流程**：结算中心 `RtIndex.vue` 仍然支持不带 `orderId` 直接从购物车进入的兼容模式。
+2. **先创建后支付**："立即购买"和"提交订单"都必须先调用后端创建 `pending` 订单，再跳转到结算中心。
+3. **状态校验**：后端 `PUT /orders/:id/status` 已有状态机校验，前端调用时无需额外校验。
+4. **错误处理**：所有异步操作必须有 `try-catch`，失败时给用户 `showToast` 提示。
+5. **定时器清理**：`RtPaySuccess.vue` 的倒计时定时器必须在 `beforeUnmount` 中清除，防止内存泄漏。
+6. **不要修改**与本次任务无关的代码。
